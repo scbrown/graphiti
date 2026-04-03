@@ -4,6 +4,8 @@ from typing import Annotated
 from fastapi import Depends, HTTPException
 from graphiti_core import Graphiti  # type: ignore
 from graphiti_core.edges import EntityEdge  # type: ignore
+from graphiti_core.embedder import EmbedderClient  # type: ignore
+from graphiti_core.embedder.local import LocalEmbedder  # type: ignore
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeNotFoundError
 from graphiti_core.llm_client import LLMClient  # type: ignore
 from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
@@ -25,9 +27,17 @@ def _make_graph_driver(settings: Settings):
     return None  # Graphiti defaults to Neo4jDriver
 
 
+def _make_embedder(settings: Settings) -> EmbedderClient | None:
+    """Create the appropriate embedder based on config."""
+    if settings.embedding_model_name == 'local' or settings.openai_api_key == 'not-used':
+        logger.info('Using LocalEmbedder (sentence-transformers)')
+        return LocalEmbedder()
+    return None  # Graphiti defaults to OpenAIEmbedder
+
+
 class ZepGraphiti(Graphiti):
-    def __init__(self, uri: str, user: str, password: str, llm_client: LLMClient | None = None, graph_driver=None):
-        super().__init__(uri, user, password, llm_client, graph_driver=graph_driver)
+    def __init__(self, uri: str, user: str, password: str, llm_client: LLMClient | None = None, embedder: EmbedderClient | None = None, graph_driver=None):
+        super().__init__(uri, user, password, llm_client, embedder=embedder, graph_driver=graph_driver)
 
     async def save_entity_node(self, name: str, uuid: str, group_id: str, summary: str = ''):
         new_node = EntityNode(
@@ -83,15 +93,17 @@ class ZepGraphiti(Graphiti):
 
 
 async def get_graphiti(settings: ZepEnvDep):
+    embedder = _make_embedder(settings)
     client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
         password=settings.neo4j_password,
+        embedder=embedder,
         graph_driver=_make_graph_driver(settings),
     )
     if settings.openai_base_url is not None:
         client.llm_client.config.base_url = settings.openai_base_url
-    if settings.openai_api_key is not None:
+    if settings.openai_api_key is not None and settings.openai_api_key != 'not-used':
         client.llm_client.config.api_key = settings.openai_api_key
     if settings.model_name is not None:
         client.llm_client.model = settings.model_name
@@ -103,10 +115,12 @@ async def get_graphiti(settings: ZepEnvDep):
 
 
 async def initialize_graphiti(settings: Settings):
+    embedder = _make_embedder(settings)
     client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
         password=settings.neo4j_password,
+        embedder=embedder,
         graph_driver=_make_graph_driver(settings),
     )
     await client.build_indices_and_constraints()
