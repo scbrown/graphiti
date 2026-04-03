@@ -2,11 +2,18 @@ import asyncio
 from contextlib import asynccontextmanager
 from functools import partial
 
-from fastapi import APIRouter, FastAPI, status
-from graphiti_core.nodes import EpisodeType  # type: ignore
+from fastapi import APIRouter, FastAPI, HTTPException, status
+from graphiti_core.edges import EntityEdge  # type: ignore
+from graphiti_core.nodes import EntityNode, EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 
-from graph_service.dto import AddEntityNodeRequest, AddMessagesRequest, Message, Result
+from graph_service.dto import (
+    AddEntityNodeRequest,
+    AddMessagesRequest,
+    CompleteEpisodeRequest,
+    Message,
+    Result,
+)
 from graph_service.zep_graphiti import ZepGraphitiDep
 
 
@@ -109,3 +116,77 @@ async def clear(
     await clear_data(graphiti.driver)
     await graphiti.build_indices_and_constraints()
     return Result(message='Graph cleared', success=True)
+
+
+@router.post('/episodes/complete', status_code=status.HTTP_201_CREATED)
+async def complete_episode(
+    request: CompleteEpisodeRequest,
+    graphiti: ZepGraphitiDep,
+):
+    """Ingest an episode with pre-extracted nodes and edges.
+
+    Crew agents perform extraction — this endpoint writes the results
+    to FalkorDB via ingest_extracted_episode(). No LLM calls.
+    """
+    # Build EntityNode objects from the simplified request format
+    nodes: list[EntityNode] = []
+    node_name_to_uuid: dict[str, str] = {}
+    for n in request.nodes:
+        entity = EntityNode(
+            name=n.name,
+            group_id=request.group_id,
+            summary=n.summary,
+            labels=n.labels,
+        )
+        nodes.append(entity)
+        node_name_to_uuid[n.name] = entity.uuid
+
+    # Build EntityEdge objects, resolving source/target names to UUIDs
+    edges: list[EntityEdge] = []
+    for e in request.edges:
+        source_uuid = node_name_to_uuid.get(e.source_node_name)
+        target_uuid = node_name_to_uuid.get(e.target_node_name)
+        if source_uuid is None or target_uuid is None:
+            missing = []
+            if source_uuid is None:
+                missing.append(f'source_node_name={e.source_node_name!r}')
+            if target_uuid is None:
+                missing.append(f'target_node_name={e.target_node_name!r}')
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f'Edge {e.name!r} references unknown node(s): {", ".join(missing)}. '
+                f'All edge endpoints must be defined in the nodes list.',
+            )
+        edge = EntityEdge(
+            name=e.name,
+            fact=e.fact,
+            group_id=request.group_id,
+            source_node_uuid=source_uuid,
+            target_node_uuid=target_uuid,
+            created_at=request.reference_time,
+        )
+        edges.append(edge)
+
+    results = await graphiti.ingest_extracted_episode(
+        name=request.name,
+        episode_body=request.episode_body,
+        source_description=request.source_description,
+        reference_time=request.reference_time,
+        nodes=nodes,
+        edges=edges,
+        group_id=request.group_id,
+    )
+
+    return {
+        'episode_uuid': results.episode.uuid,
+        'nodes': [{'uuid': n.uuid, 'name': n.name} for n in results.nodes],
+        'edges': [
+            {
+                'uuid': e.uuid,
+                'name': e.name,
+                'source_node_uuid': e.source_node_uuid,
+                'target_node_uuid': e.target_node_uuid,
+            }
+            for e in results.edges
+        ],
+    }
