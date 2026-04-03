@@ -16,6 +16,7 @@ except ImportError:
 
 # Kuzu support removed - FalkorDB is now the default
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
+from graphiti_core.embedder.local import LocalEmbedder
 from graphiti_core.llm_client import LLMClient, OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 
@@ -92,6 +93,17 @@ def _validate_api_key(provider_name: str, api_key: str | None, logger) -> str:
     logger.info(f'Creating {provider_name} client')
 
     return api_key
+
+
+class NoOpLLMClient(LLMClient):
+    """LLM client that raises on any call — crew agents handle extraction, not Graphiti."""
+
+    def __init__(self):
+        config = GraphitiLLMConfig(api_key='not-used', model='noop')
+        super().__init__(config=config)
+
+    async def _generate_response(self, *args, **kwargs):
+        raise RuntimeError('LLM pipeline disabled — crew agents handle extraction')
 
 
 class LLMClientFactory:
@@ -242,6 +254,10 @@ class LLMClientFactory:
                 )
                 return GroqClient(config=llm_config)
 
+            case 'noop':
+                logger.info('Creating NoOpLLMClient (LLM disabled — crew handles extraction)')
+                return NoOpLLMClient()
+
             case _:
                 raise ValueError(f'Unsupported LLM provider: {provider}')
 
@@ -353,6 +369,10 @@ class EmbedderFactory:
                     embedding_dim=config.dimensions or 1024,
                 )
                 return VoyageAIEmbedder(config=voyage_config)
+
+            case 'local':
+                logger.info('Creating LocalEmbedder (sentence-transformers)')
+                return LocalEmbedder()
 
             case _:
                 raise ValueError(f'Unsupported Embedder provider: {provider}')

@@ -1,0 +1,24 @@
+# Graphiti MCP Server Config — aegis crew ontology
+# Uses LocalEmbedder (sentence-transformers) and NoOp LLM (crew does extraction)
+server:
+  transport: "http"
+  host: "0.0.0.0"
+  port: 8001
+
+llm:
+  provider: "noop"
+  model: "noop"
+
+embedder:
+  provider: "local"
+  model: "all-MiniLM-L6-v2"
+  dimensions: 384
+
+database:
+  provider: "falkordb"
+  providers:
+    falkordb:
+      uri: "${FALKORDB_URI:redis://192.168.7.243:6379}"
+
+graphiti:
+  group_id: "${GRAPHITI_GROUP_ID:aegis-ontology}"
