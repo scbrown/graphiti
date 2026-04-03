@@ -8,15 +8,26 @@ from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, No
 from graphiti_core.llm_client import LLMClient  # type: ignore
 from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
 
-from graph_service.config import ZepEnvDep
+from graph_service.config import Settings, ZepEnvDep
 from graph_service.dto import FactResult
 
 logger = logging.getLogger(__name__)
 
 
+def _make_graph_driver(settings: Settings):
+    """Create the appropriate graph driver based on config."""
+    if settings.graph_db_provider == 'falkordb':
+        from graphiti_core.driver.falkordb_driver import FalkorDriver
+        return FalkorDriver(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+        )
+    return None  # Graphiti defaults to Neo4jDriver
+
+
 class ZepGraphiti(Graphiti):
-    def __init__(self, uri: str, user: str, password: str, llm_client: LLMClient | None = None):
-        super().__init__(uri, user, password, llm_client)
+    def __init__(self, uri: str, user: str, password: str, llm_client: LLMClient | None = None, graph_driver=None):
+        super().__init__(uri, user, password, llm_client, graph_driver=graph_driver)
 
     async def save_entity_node(self, name: str, uuid: str, group_id: str, summary: str = ''):
         new_node = EntityNode(
@@ -76,6 +87,7 @@ async def get_graphiti(settings: ZepEnvDep):
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
         password=settings.neo4j_password,
+        graph_driver=_make_graph_driver(settings),
     )
     if settings.openai_base_url is not None:
         client.llm_client.config.base_url = settings.openai_base_url
@@ -90,11 +102,12 @@ async def get_graphiti(settings: ZepEnvDep):
         await client.close()
 
 
-async def initialize_graphiti(settings: ZepEnvDep):
+async def initialize_graphiti(settings: Settings):
     client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
         password=settings.neo4j_password,
+        graph_driver=_make_graph_driver(settings),
     )
     await client.build_indices_and_constraints()
 
