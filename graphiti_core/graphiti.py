@@ -716,6 +716,129 @@ class Graphiti:
 
         return episodic_edges, episode
 
+    async def ingest_extracted_episode(
+        self,
+        name: str,
+        episode_body: str,
+        source_description: str,
+        reference_time: datetime,
+        nodes: list[EntityNode],
+        edges: list[EntityEdge],
+        source: EpisodeType = EpisodeType.message,
+        group_id: str | None = None,
+        saga: str | SagaNode | None = None,
+    ) -> AddEpisodeResults:
+        """Ingest an episode with pre-extracted nodes and edges.
+
+        Writes the episode, nodes, and edges to the graph in a single
+        transaction. No LLM calls — the caller (e.g., a crew agent) has
+        already performed extraction and resolution. Only the embedder is
+        used (for semantic search vectors on node names and edge facts).
+
+        This method is the core write path for crew-driven extraction,
+        where crew agents ARE the LLM and extract knowledge from episodes
+        themselves.
+
+        Parameters
+        ----------
+        name : str
+            The name of the episode.
+        episode_body : str
+            The content of the episode.
+        source_description : str
+            A description of the episode's source (e.g., "crew/dearing extraction
+            from handoff mail hq-3wmc").
+        reference_time : datetime
+            The reference time for the episode (when the event occurred).
+        nodes : list[EntityNode]
+            Pre-extracted entity nodes. Each node should have at minimum a name,
+            summary, and labels list. Embeddings will be generated automatically
+            if not already present.
+        edges : list[EntityEdge]
+            Pre-extracted entity edges. Each edge should have at minimum a name,
+            fact, source_node_uuid, and target_node_uuid. Embeddings will be
+            generated automatically if not already present.
+        source : EpisodeType, optional
+            The type of the episode. Defaults to EpisodeType.message.
+        group_id : str | None, optional
+            An id for the graph partition. If None, uses the driver's default.
+        saga : str | SagaNode | None, optional
+            Optional saga to associate this episode with.
+
+        Returns
+        -------
+        AddEpisodeResults
+            Results containing the episode, episodic edges, nodes, edges,
+            and empty community lists (communities are not updated in this path).
+
+        Notes
+        -----
+        Unlike add_episode(), this method:
+        - Does NOT call any LLM for extraction or deduplication
+        - Does NOT run community detection
+        - DOES generate embeddings via the configured embedder (local or API)
+        - DOES write everything to FalkorDB in a single transaction
+
+        Example:
+            results = await graphiti.ingest_extracted_episode(
+                name="koror-p0-incident",
+                episode_body="koror went down at 03:00...",
+                source_description="crew/dearing extraction",
+                reference_time=datetime(2026, 4, 3, 10, 0),
+                nodes=[EntityNode(name="koror", summary="Host", labels=["Host"])],
+                edges=[EntityEdge(
+                    name="runs_on", fact="dolt-server runs on koror",
+                    source_node_uuid=node1.uuid, target_node_uuid=node2.uuid,
+                )],
+            )
+        """
+        now = utc_now()
+
+        # Validate and resolve group_id (same pattern as add_episode)
+        if group_id is None:
+            group_id = get_default_group_id(self.driver.provider)
+        else:
+            validate_group_id(group_id)
+            if group_id != self.driver._database:
+                self.driver = self.driver.clone(database=group_id)
+                self.clients.driver = self.driver
+
+        # Create the episode node
+        episode = EpisodicNode(
+            name=name,
+            group_id=group_id,
+            labels=[],
+            source=source,
+            content=episode_body,
+            source_description=source_description,
+            created_at=now,
+            valid_at=reference_time,
+        )
+
+        # Generate embeddings for nodes that don't have them yet
+        for node in nodes:
+            if node.name_embedding is None:
+                await node.generate_name_embedding(self.embedder)
+
+        # Generate embeddings for edges that don't have them yet
+        for edge in edges:
+            if edge.fact_embedding is None:
+                await edge.generate_embedding(self.embedder)
+
+        # Write everything to the graph in a single transaction
+        episodic_edges, episode = await self._process_episode_data(
+            episode, nodes, edges, now, group_id, saga,
+        )
+
+        return AddEpisodeResults(
+            episode=episode,
+            nodes=nodes,
+            edges=edges,
+            episodic_edges=episodic_edges,
+            communities=[],
+            community_edges=[],
+        )
+
     async def _extract_and_dedupe_nodes_bulk(
         self,
         episode_context: list[tuple[EpisodicNode, list[EpisodicNode]]],
