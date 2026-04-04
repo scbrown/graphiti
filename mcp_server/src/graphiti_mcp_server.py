@@ -14,7 +14,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
-from graphiti_core.nodes import EpisodeType, EpisodicNode
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
@@ -751,6 +751,156 @@ async def get_status() -> StatusResponse:
             status='error',
             message=f'Graphiti MCP server is running but database connection failed: {error_msg}',
         )
+
+
+@mcp.tool()
+async def write_episode(
+    name: str,
+    episode_body: str,
+    group_id: str | None = None,
+    source_description: str = '',
+    reference_time: str | None = None,
+    nodes: list[dict] | None = None,
+    edges: list[dict] | None = None,
+) -> SuccessResponse | ErrorResponse:
+    """Write an episode with optional pre-extracted nodes and edges to the knowledge graph.
+
+    This is the primary way for crew agents to ingest knowledge into the ontology.
+    If nodes and edges are provided, they are written directly (no LLM extraction).
+    If only episode_body is provided, the episode is queued for LLM-based extraction.
+
+    Args:
+        name (str): Episode name (e.g. "NFS storage infrastructure")
+        episode_body (str): The knowledge content to ingest
+        group_id (str, optional): Graph partition ID (defaults to server config)
+        source_description (str, optional): Where this knowledge came from (e.g. "aegis-c8x bead")
+        reference_time (str, optional): ISO 8601 timestamp for when the event occurred.
+                                        Defaults to current time.
+        nodes (list[dict], optional): Pre-extracted entities. Each dict has:
+            - name (str): Entity name
+            - summary (str, optional): Entity description
+            - labels (list[str], optional): Entity type labels
+        edges (list[dict], optional): Pre-extracted relationships. Each dict has:
+            - name (str): Relationship name
+            - fact (str): Description of the relationship
+            - source_node_name (str): Name of source entity (must be in nodes list)
+            - target_node_name (str): Name of target entity (must be in nodes list)
+
+    Examples:
+        # Simple episode (LLM extracts entities)
+        write_episode(
+            name="NFS mount fix",
+            episode_body="Fixed 7 NFS mounts from koror to kota...",
+            group_id="aegis-ontology",
+            source_description="aegis-c8x bead"
+        )
+
+        # Episode with pre-extracted entities (no LLM needed)
+        write_episode(
+            name="Service topology",
+            episode_body="Traefik on CT 229 routes to Grafana on CT 212",
+            group_id="aegis-ontology",
+            nodes=[
+                {"name": "Traefik", "summary": "Reverse proxy", "labels": ["Service"]},
+                {"name": "Grafana", "summary": "Monitoring dashboard", "labels": ["Service"]}
+            ],
+            edges=[
+                {"name": "routes_to", "fact": "Traefik routes traffic to Grafana",
+                 "source_node_name": "Traefik", "target_node_name": "Grafana"}
+            ]
+        )
+    """
+    global graphiti_service, queue_service
+
+    if graphiti_service is None or queue_service is None:
+        return ErrorResponse(error='Services not initialized')
+
+    try:
+        from datetime import datetime, timezone
+
+        effective_group_id = group_id or config.graphiti.group_id
+
+        # Parse reference_time or default to now
+        if reference_time:
+            ref_time = datetime.fromisoformat(reference_time)
+        else:
+            ref_time = datetime.now(timezone.utc)
+
+        # If nodes/edges provided, use ingest_extracted_episode (no LLM)
+        if nodes:
+            client = await graphiti_service.get_client()
+
+            # Build EntityNode objects
+            entity_nodes: list[EntityNode] = []
+            node_name_to_uuid: dict[str, str] = {}
+            for n in nodes:
+                entity = EntityNode(
+                    name=n['name'],
+                    group_id=effective_group_id,
+                    summary=n.get('summary', ''),
+                    labels=n.get('labels', []),
+                )
+                entity_nodes.append(entity)
+                node_name_to_uuid[n['name']] = entity.uuid
+
+            # Build EntityEdge objects
+            entity_edges: list[EntityEdge] = []
+            for e in (edges or []):
+                source_uuid = node_name_to_uuid.get(e['source_node_name'])
+                target_uuid = node_name_to_uuid.get(e['target_node_name'])
+                if source_uuid is None or target_uuid is None:
+                    missing = []
+                    if source_uuid is None:
+                        missing.append(f"source={e['source_node_name']!r}")
+                    if target_uuid is None:
+                        missing.append(f"target={e['target_node_name']!r}")
+                    return ErrorResponse(
+                        error=f"Edge {e['name']!r} references unknown node(s): {', '.join(missing)}. "
+                        f'All edge endpoints must be defined in the nodes list.'
+                    )
+                edge = EntityEdge(
+                    name=e['name'],
+                    fact=e['fact'],
+                    group_id=effective_group_id,
+                    source_node_uuid=source_uuid,
+                    target_node_uuid=target_uuid,
+                    created_at=ref_time,
+                )
+                entity_edges.append(edge)
+
+            results = await client.ingest_extracted_episode(
+                name=name,
+                episode_body=episode_body,
+                source_description=source_description,
+                reference_time=ref_time,
+                nodes=entity_nodes,
+                edges=entity_edges,
+                group_id=effective_group_id,
+            )
+
+            return SuccessResponse(
+                message=f"Episode '{name}' ingested with {len(results.nodes)} nodes and "
+                f"{len(results.edges)} edges in group '{effective_group_id}'"
+            )
+        else:
+            # No pre-extracted entities — queue for LLM-based extraction
+            await queue_service.add_episode(
+                group_id=effective_group_id,
+                name=name,
+                content=episode_body,
+                source_description=source_description,
+                episode_type=EpisodeType.text,
+                entity_types=graphiti_service.entity_types,
+                uuid=None,
+            )
+
+            return SuccessResponse(
+                message=f"Episode '{name}' queued for extraction in group '{effective_group_id}'"
+            )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error writing episode: {error_msg}')
+        return ErrorResponse(error=f'Error writing episode: {error_msg}')
 
 
 @mcp.custom_route('/health', methods=['GET'])
