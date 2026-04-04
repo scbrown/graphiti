@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     graph_db_provider: str = Field('neo4j')
     falkordb_host: str = Field('localhost')
     falkordb_port: int = Field(6379)
+    falkordb_default_database: str = Field('default_db')
 
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 

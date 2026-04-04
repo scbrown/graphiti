@@ -23,6 +23,7 @@ def _make_graph_driver(settings: Settings):
         return FalkorDriver(
             host=settings.falkordb_host,
             port=settings.falkordb_port,
+            database=settings.falkordb_default_database,
         )
     return None  # Graphiti defaults to Neo4jDriver
 
